@@ -23,6 +23,92 @@ from gensim.utils import deprecated
 logger = logging.getLogger(__name__)
 
 
+def validate_bow_document(doc, max_id=None):
+    """Validate one document in the standard sparse Gensim bag-of-words format.
+
+    A valid document is an iterable of ``(term_id, count)`` pairs where
+
+    * every `term_id` is a non-negative :class:`int` (:class:`bool` is rejected),
+    * term ids are strictly increasing (no duplicates, no reordering),
+    * every `count` is a finite, positive real number (:class:`bool` is rejected,
+      as are NaN, infinities, zero and negative counts),
+    * if `max_id` is given, every term id is strictly smaller than it.
+
+    Empty documents are valid: they still count towards the document total.
+
+    Parameters
+    ----------
+    doc : iterable of (int, float)
+        One bag-of-words document.
+    max_id : int, optional
+        Exclusive upper bound on term ids (typically ``num_features``).
+
+    Returns
+    -------
+    list of (int, float)
+        The validated document, materialized into a list of tuples.
+
+    Raises
+    ------
+    ValueError
+        If the document does not follow the format described above.
+
+    """
+    try:
+        pairs = list(doc)
+    except TypeError:
+        raise ValueError("each document must be an iterable of (term_id, count) pairs")
+
+    previous_id = None
+    for pair in pairs:
+        try:
+            termid, count = pair
+        except (TypeError, ValueError):
+            raise ValueError("each BoW entry must be a (term_id, count) pair, got %r" % (pair,))
+
+        # bool is a subclass of int: reject it explicitly for both the id and the count.
+        # NumPy integer/floating scalars are accepted as exact stand-ins for Python numbers;
+        # floats, strings, complex values and containers are not valid term ids.
+        if isinstance(termid, bool):
+            raise ValueError(
+                "term ids must be non-negative integers (booleans are not allowed), got %r" % (termid,)
+            )
+        if isinstance(termid, np.integer):
+            termid = int(termid)
+        if not isinstance(termid, int) or termid < 0:
+            raise ValueError(
+                "term ids must be non-negative integers (booleans are not allowed), got %r" % (termid,)
+            )
+        if max_id is not None and termid >= max_id:
+            raise ValueError(
+                "term id %i is out of range: must be smaller than num_features=%i" % (termid, max_id)
+            )
+        if previous_id is not None and termid <= previous_id:
+            raise ValueError(
+                "term ids must be strictly increasing (no duplicate or unordered ids), "
+                "got id %i after %i" % (termid, previous_id)
+            )
+        if isinstance(count, bool) or isinstance(count, complex):
+            raise ValueError(
+                "counts must be finite positive real numbers (booleans are not allowed), got %r" % (count,)
+            )
+        if isinstance(count, np.floating):
+            count = float(count)
+        if isinstance(count, np.integer):
+            count = int(count)
+        if not isinstance(count, (int, float)):
+            raise ValueError(
+                "counts must be finite positive real numbers (booleans are not allowed), got %r" % (count,)
+            )
+        if not np.isfinite(count) or count <= 0:
+            raise ValueError(
+                "counts must be finite positive real numbers, got %r" % (count,)
+            )
+        previous_id = termid
+
+    return [(termid, count) for termid, count in pairs]
+
+
 def resolve_weights(smartirs):
     """Check the validity of `smartirs` parameters.
 
@@ -257,6 +343,20 @@ class TfidfModel(interfaces.TransformationABC):
         >>> model = TfidfModel(corpus)  # fit model
         >>> vector = model[corpus[0]]  # apply model to the first corpus document
 
+    Incremental updates
+    -------------------
+    A model fitted with the default configuration (identity local weight, :func:`df2idf`
+    global weight, ``normalize`` True/False, no SMART scheme and no pivoted normalization) can
+    be extended with additional document batches through :meth:`add_documents`; the document
+    frequencies, document counts and IDF weights are updated cumulatively without replaying any
+    previously seen corpus, and every later transform uses the statistics of all documents
+    received so far:
+
+    .. sourcecode:: pycon
+
+        >>> model = TfidfModel(first_batch)
+        >>> model.add_documents(second_batch)  # raises ValueError on malformed input, atomically
+
     """
     def __init__(self, corpus=None, id2word=None, dictionary=None, wlocal=utils.identity,
                  wglobal=df2idf, normalize=True, smartirs=None, pivot=None, slope=0.25):
@@ -461,6 +561,155 @@ class TfidfModel(interfaces.TransformationABC):
             msg=(
                 f"calculated IDF weights for {self.num_docs} documents and {max(dfs.keys()) + 1 if dfs else 0}"
                 f" features ({self.num_nnz} matrix non-zeros)"
+            ),
+        )
+
+    def _check_incremental_supported(self):
+        """Check whether this model's configuration can be updated with :meth:`add_documents`.
+
+        Only the default configuration is supported incrementally: identity local weighting,
+        :func:`df2idf` global weighting, boolean ``normalize`` and no SMART / pivoted schemes.
+
+        Raises
+        ------
+        ValueError
+            If any unsupported option is active. The check happens before the input corpus
+            is read, so no input is consumed on failure.
+
+        """
+        if self.smartirs is not None:
+            raise ValueError(
+                "add_documents only supports the default weighting configuration; "
+                "models fitted with smartirs=%r cannot be updated incrementally" % (self.smartirs,)
+            )
+        if self.pivot is not None:
+            raise ValueError(
+                "add_documents only supports models without pivoted length normalization (pivot must be None, "
+                "got %r)" % (self.pivot,)
+            )
+        if self.wlocal is not utils.identity:
+            raise ValueError(
+                "add_documents only supports the default wlocal=gensim.utils.identity, got %r" % (self.wlocal,)
+            )
+        if self.wglobal is not df2idf:
+            raise ValueError(
+                "add_documents only supports the default wglobal=gensim.models.tfidfmodel.df2idf, got %r"
+                % (self.wglobal,)
+            )
+        # __getitem__ resolves normalize=True/False to these functions in place; accept both forms
+        allowed_normalize = (True, False, matutils.unitvec, utils.identity)
+        if self.normalize not in allowed_normalize:
+            raise ValueError(
+                "add_documents only supports normalize=True or normalize=False, got %r" % (self.normalize,)
+            )
+
+    def add_documents(self, corpus):
+        """Update the collection statistics (:attr:`num_docs`, :attr:`num_nnz`, :attr:`dfs`, :attr:`idfs`)
+        with an additional batch of documents, without replaying any previously seen corpus.
+
+        Only the default model configuration is supported: ``wlocal=utils.identity``,
+        ``wglobal=df2idf``, ``normalize`` set to ``True`` or ``False``, ``smartirs=None``
+        and ``pivot=None``; any other configuration raises :class:`ValueError` before the
+        input is read.
+
+        Parameters
+        ----------
+        corpus : iterable of iterable of (int, float)
+            One batch of documents in the standard sparse bag-of-words format: each document is
+            an iterable of ``(term_id, count)`` pairs with non-negative integer term ids in strictly
+            increasing order and finite, positive real counts (:class:`bool` is not accepted).
+            Empty documents are valid and still count towards the document total. A generator is
+            consumed exactly once.
+
+        Returns
+        -------
+        :class:`~gensim.models.tfidfmodel.TfidfModel`
+            ``self``, so calls can be chained. An empty batch leaves every statistic untouched.
+
+        Raises
+        ------
+        ValueError
+            If the model configuration is not supported incrementally (raised before the input is
+            read) or if any document violates the bag-of-words format. On a format error the whole
+            batch is rejected and no statistic is partially updated.
+        Exception
+            Any exception raised by the input iterator itself is propagated unchanged, again with
+            no partial statistics left behind.
+
+        Notes
+        -----
+        After a successful update, every subsequent :meth:`__getitem__` transformation -- including
+        queries -- uses IDF weights computed from all documents received so far. A term that used to
+        appear in every document (IDF zero) becomes a valid retrieval term again as soon as later
+        batches contain documents without it.
+
+        Examples
+        --------
+        .. sourcecode:: pycon
+
+            >>> from gensim.models import TfidfModel
+            >>> model = TfidfModel([[(0, 1), (1, 1)], [(0, 2)]])  # fit an initial batch
+            >>> model.add_documents([[(1, 1), (2, 1)]])  # extend with another batch
+            >>> model.num_docs
+            3
+
+        """
+        self._check_incremental_supported()
+
+        # Accumulate into local state only: self is not touched until the whole batch is validated,
+        # so a failure mid-iteration leaves no partial statistics.
+        batch_docs, batch_nnz = 0, 0
+        batch_dfs = {}
+        for doc in corpus:
+            bow = validate_bow_document(doc)
+            batch_docs += 1
+            batch_nnz += len(bow)
+            for termid, _ in bow:
+                batch_dfs[termid] = batch_dfs.get(termid, 0) + 1
+
+        if batch_docs == 0:
+            # an empty batch must not change any statistic (and must not "initialize" an empty model)
+            return self
+
+        self._merge_batch_statistics(batch_docs, batch_nnz, batch_dfs)
+        return self
+
+    def _merge_batch_statistics(self, batch_docs, batch_nnz, batch_dfs):
+        """Merge statistics of one already validated batch into the collection statistics.
+
+        Parameters
+        ----------
+        batch_docs : int
+            Number of documents in the batch (empty documents count).
+        batch_nnz : int
+            Total number of non-zero ``(term_id, count)`` pairs in the batch.
+        batch_dfs : dict of (int, int)
+            Per-term document frequency accumulated from the batch documents.
+
+        Notes
+        -----
+        Used both by :meth:`add_documents` and by the streaming TF-IDF mode of
+        :class:`~gensim.similarities.docsim.Similarity`, which streams a batch once for both
+        ingestion and statistics and therefore cannot call :meth:`add_documents` on the same
+        iterator a second time.
+
+        """
+        if self.num_docs is None:
+            # an uninitialized model starts from an empty collection
+            self.num_docs, self.num_nnz, self.dfs = 0, 0, {}
+            self.cfs = None
+            self.term_lengths = None
+
+        for termid, df in batch_dfs.items():
+            self.dfs[termid] = self.dfs.get(termid, 0) + df
+        self.num_docs += batch_docs
+        self.num_nnz += batch_nnz
+        self.idfs = precompute_idfs(self.wglobal, self.dfs, self.num_docs)
+        self.add_lifecycle_event(
+            "add_documents",
+            msg=(
+                f"updated IDF weights incrementally for {batch_docs} new documents; "
+                f"{self.num_docs} documents and {len(self.dfs)} features in total ({self.num_nnz} non-zeros)"
             ),
         )
 

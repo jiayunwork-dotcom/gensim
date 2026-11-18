@@ -68,10 +68,34 @@ uses the faster, batch queries internally and **is ideal for all-vs-all pairwise
     >>> for similarities in index:  # yield similarities of the 1st indexed document, then 2nd...
     ...     pass
 
+Streaming TF-IDF over a continuously arriving corpus
+-----------------------------------------------------
+Passing ``tfidf=True`` to :class:`Similarity` switches the index to *streaming TF-IDF mode*:
+the constructor, :meth:`~Similarity.add_documents` and queries all take raw bag-of-words
+documents instead of pre-weighted vectors. The index stores the raw counts in disk shards and
+owns a default :class:`~gensim.models.tfidfmodel.TfidfModel` whose collection statistics grow
+on every accepted batch. Every query is weighted with the statistics of all documents
+received so far, so old and new shards always share one collection-wide TF-IDF statistic:
+
+.. sourcecode:: pycon
+
+    >>> from gensim.similarities import Similarity
+    >>>
+    >>> index = Similarity(get_tmpfile("streaming"), first_batch, num_features=num_terms, tfidf=True)
+    >>> index.add_documents(second_batch)  # raw BoW; the owned TfidfModel is updated atomically
+    >>> similarities = index[raw_bow_query]  # weighted against the statistics of BOTH batches
+    >>> stats = index.tfidf_model.num_docs, index.tfidf_model.dfs  # read-only inspection
+
+A term whose IDF used to be zero (it occurred in every earlier document) is not lost: its raw
+counts remain on disk and it becomes an effective retrieval term again once later batches
+lower its document frequency. See :class:`Similarity` for the input format, failure atomicity
+and persistence guarantees.
+
 """
 import logging
 import itertools
 import os
+import glob
 import heapq
 import warnings
 
@@ -79,6 +103,7 @@ import numpy
 import scipy.sparse
 
 from gensim import interfaces, utils, matutils
+from gensim.models.tfidfmodel import TfidfModel, validate_bow_document
 
 
 logger = logging.getLogger(__name__)
@@ -212,6 +237,171 @@ class Shard(utils.SaveLoad):
         return index[query]
 
 
+class TfidfShard(utils.SaveLoad):
+    """A disk-backed shard of *raw bag-of-words* counts for TF-IDF mode.
+
+    Unlike :class:`Shard`, which stores already weighted document vectors, a
+    :class:`TfidfShard` stores the original term counts as a
+    :class:`scipy.sparse.csr_matrix`. The term counts never change when more documents are
+    appended: only the collection statistics owned by the
+    :class:`~gensim.models.tfidfmodel.TfidfModel` change. At query time each shard is re-weighted
+    with the *current* IDF vector, so old and new shards always share one collection-wide
+    statistic. A term whose IDF used to be zero (it appeared in every document of an earlier
+    batch) is kept here with its raw count and becomes a valid retrieval term again once later
+    batches lower its document frequency.
+
+    The count matrix is stored as separate ``.npy`` files and can be memory-mapped read-only,
+    so opening a shard does not copy it into Python heap memory.
+
+    """
+
+    def __init__(self, fname, docs, num_features):
+        """
+
+        Parameters
+        ----------
+        fname : str
+            Path of the shard file (without the numpy suffixes added by SaveLoad).
+        docs : list of list of (int, float)
+            Raw bag-of-words documents in this shard (already validated by the caller).
+        num_features : int
+            Fixed number of features; every term id is known to be smaller than it.
+
+        """
+        self.dirname, self.fname = os.path.split(fname)
+        self.num_features = num_features
+        self.length = len(docs)
+        num_nnz = sum(len(doc) for doc in docs)
+        # matutils.corpus2csc gives documents as columns; transpose for documents-as-rows CSR.
+        # Raw counts are stored in float32: this is the same storage precision the ordinary
+        # (non-TF-IDF) Similarity path uses for its shard matrices.
+        self._data = matutils.corpus2csc(
+            docs, num_terms=num_features, num_docs=self.length, num_nnz=num_nnz, dtype=numpy.float32
+        ).T.tocsr()
+        logger.info("saving TF-IDF index shard to %s", self.fullname())
+        # always store the count matrix in side files (never inside the pickle), so it can be
+        # memory-mapped read-only regardless of the shard's size
+        self.save(self.fullname(), separately=['_data'])
+        # drop the in-memory build matrix; shards are re-mapped on demand at query time
+        del self._data
+
+    def fullname(self):
+        """Get full path to the shard file.
+
+        Returns
+        -------
+        str
+            Path to the shard.
+
+        """
+        return os.path.join(self.dirname, self.fname)
+
+    def __len__(self):
+        """Number of documents stored in this shard."""
+        return self.length
+
+    def __getstate__(self):
+        """Pickle everything except the (possibly memory-mapped) matrix, which is saved separately."""
+        result = self.__dict__.copy()
+        if 'index' in result:
+            del result['index']
+        if '_data' in result:
+            del result['_data']
+        return result
+
+    def __str__(self):
+        return "%s<%i documents in %s>" % (self.__class__.__name__, len(self), self.fullname())
+
+    def get_index(self):
+        """Load (or memory-map) the raw count matrix.
+
+        Returns
+        -------
+        :class:`scipy.sparse.csr_matrix`
+            Raw document-term counts, documents as rows. Large arrays are memory-mapped
+            read-only through the standard SaveLoad mechanism; small ones are unpickled
+            together with the proxy.
+
+        Note
+        ----
+        Callers that scan many shards (the query path) go through the owner's bounded LRU in
+        :meth:`Similarity._all_weighted_shards` instead; this direct accessor is retained for
+        single-shard operations such as :meth:`get_document_id` and tests.
+
+        """
+        if not hasattr(self, '_data'):
+            logger.debug("mmaping TF-IDF shard from %s", self.fullname())
+            loaded = utils.SaveLoad.load(self.fullname(), mmap='r')
+            self._data = loaded._data
+        return self._data
+
+    def load_raw(self):
+        """Memory-map the raw matrix without pinning it onto this proxy.
+
+        Returns a matrix the caller owns; nothing is stored on the shard, so the query loop in
+        :meth:`Similarity._all_weighted_shards` can release the mapping again after building the
+        weighted matrix for one shard.
+        """
+        loaded = utils.SaveLoad.load(self.fullname(), mmap='r')
+        return loaded._data
+
+    def weighted_index(self, idf_values):
+        """Build the current L2-normalized TF-IDF matrix for this shard.
+
+        Parameters
+        ----------
+        idf_values : :class:`numpy.ndarray`
+            Current collection-wide IDF weight for every feature, length ``num_features``.
+
+        Returns
+        -------
+        :class:`scipy.sparse.csr_matrix`
+            Row-L2-normalized TF-IDF vectors, one row per stored document. Entries whose weight
+            is zero (unknown term or zero IDF) are dropped, matching
+            :class:`~gensim.models.tfidfmodel.TfidfModel` semantics. The raw count matrix on
+            disk is never modified.
+
+        """
+        raw = self.get_index()
+        return self.weighted_index_from_raw(raw, idf_values)
+
+    @staticmethod
+    def weighted_index_from_raw(raw, idf_values):
+        """Apply current IDF weights and row L2 normalization to a raw count matrix.
+
+        Pure function of its two arguments: the raw matrix on disk is never modified and the
+        same raw matrix can be re-weighted with successive IDF vectors as the collection grows.
+        """
+        idf_diag = scipy.sparse.diags(idf_values.astype(numpy.float32, copy=False))
+        weighted = (raw @ idf_diag).tocsr()
+        weighted.eliminate_zeros()
+        # normalize each row to unit L2 length; all-zero rows are returned unchanged
+        norms = numpy.sqrt(numpy.asarray(weighted.multiply(weighted).sum(axis=1)).ravel())
+        inv = numpy.zeros_like(norms)
+        nonzero = norms > 0.0
+        inv[nonzero] = 1.0 / norms[nonzero]
+        weighted = scipy.sparse.diags(inv.astype(numpy.float32)) @ weighted
+        weighted.eliminate_zeros()
+        return weighted.tocsr()
+
+    def get_document_id(self, pos):
+        """Raw count vector of the document at shard-local position `pos`.
+
+        Parameters
+        ----------
+        pos : int
+            Shard-local row position.
+
+        Returns
+        -------
+        :class:`scipy.sparse.csr_matrix`
+            One-row CSR matrix of raw counts.
+
+        """
+        assert 0 <= pos < len(self), "requested position out of range"
+        return self.get_index()[pos]
+
+
 def query_shard(args):
     """Helper for request query from shard, same as shard[query].
 
@@ -302,7 +492,8 @@ class Similarity(interfaces.SimilarityABC):
 
     """
 
-    def __init__(self, output_prefix, corpus, num_features, num_best=None, chunksize=256, shardsize=32768, norm='l2'):
+    def __init__(self, output_prefix, corpus, num_features, num_best=None, chunksize=256, shardsize=32768,
+                 norm='l2', *, tfidf=False):
         """
 
         Parameters
@@ -310,7 +501,8 @@ class Similarity(interfaces.SimilarityABC):
         output_prefix : str
             Prefix for shard filename. If None, a random filename in temp will be used.
         corpus : iterable of list of (int, number)
-            Corpus in streamed Gensim bag-of-words format.
+            Corpus in streamed Gensim bag-of-words format. With ``tfidf=True`` this must be
+            raw bag-of-words counts (see the `tfidf` parameter).
         num_features : int
             Size of the dictionary (number of features).
         num_best : int, optional
@@ -322,7 +514,26 @@ class Similarity(interfaces.SimilarityABC):
             Maximum shard size, in documents. Choose a value so that a `shardsize x chunksize` matrix of floats fits
             comfortably into your RAM.
         norm : {'l1', 'l2'}, optional
-            Normalization to use.
+            Normalization to use. When `tfidf` is enabled only ``'l2'`` is allowed.
+        tfidf : bool, optional, keyword-only
+            If ``False`` (the default), keep the historical behaviour: the index stores the
+            vectors passed in by the caller and :meth:`add_documents` appends those vectors
+            unchanged.
+
+            If ``True``, switch to *streaming TF-IDF mode*: the constructor,
+            :meth:`add_documents` and queries all accept **raw bag-of-words** documents
+            (iterables of strictly increasing ``(term_id, count)`` pairs with finite positive
+            real counts; empty documents are accepted and still occupy a row). The index keeps
+            the raw counts on disk and owns a default
+            :class:`~gensim.models.tfidfmodel.TfidfModel` (identity local weight,
+            :func:`~gensim.models.tfidfmodel.df2idf` global weight, L2-normalized) whose
+            collection statistics are extended on every batch. Every query -- against old and
+            new documents alike -- is weighted with the TF-IDF statistics computed from *all
+            documents received so far*, which is equivalent to rebuilding a default model over
+            the whole accumulated corpus. The model is exposed read-only through the
+            :attr:`tfidf_model` property. Term ids must be smaller than `num_features`.
+            Only ``norm='l2'`` is supported in this mode; an invalid combination is rejected
+            before any input is read.
 
         Notes
         -----
@@ -337,6 +548,20 @@ class Similarity(interfaces.SimilarityABC):
         These are more simple but do not scale as well (they keep the entire index in RAM, no sharding).
         They also do not support adding new document dynamically.
 
+        Streaming TF-IDF mode (``tfidf=True``)
+        --------------------------------------
+        * Input documents are validated as they are streamed; a malformed document or an exception
+          raised by the input iterator aborts the whole batch atomically: no document, no model
+          statistic and no queryable content from the failed batch is kept, earlier batches remain
+          queryable and a later valid batch can be appended normally.
+        * Raw counts are spilled to disk in shards of at most `shardsize` documents; no full
+          historical copy of the corpus or of its weighted vectors is held in working memory.
+        * A term that had zero IDF in earlier batches (it occurred in every document) keeps its raw
+          counts on disk and starts contributing to queries as soon as later batches lower its
+          document frequency.
+        * :meth:`save` / :meth:`load` persist the raw shards together with the model statistics, so
+          an index can be reloaded and appended to with identical results to an uninterrupted run.
+
         """
         if output_prefix is None:
             # undocumented feature: set output_prefix=None to create the server in temp
@@ -344,6 +569,16 @@ class Similarity(interfaces.SimilarityABC):
         else:
             self.output_prefix = output_prefix
         logger.info("starting similarity index under %s", self.output_prefix)
+        self.tfidf = bool(tfidf)
+        if self.tfidf and norm != 'l2':
+            raise ValueError(
+                "streaming TF-IDF mode (tfidf=True) only supports norm='l2', got norm=%r" % (norm,)
+            )
+        if self.tfidf and (not isinstance(num_features, int) or isinstance(num_features, bool)
+                           or num_features <= 0):
+            raise ValueError(
+                "tfidf=True requires a positive integer num_features, got %r" % (num_features,)
+            )
         self.num_features = num_features
         self.num_best = num_best
         self.norm = norm
@@ -351,9 +586,35 @@ class Similarity(interfaces.SimilarityABC):
         self.shardsize = shardsize
         self.shards = []
         self.fresh_docs, self.fresh_nnz = [], 0
+        if self.tfidf:
+            # the index owns this model; callers inspect it through the read-only `tfidf_model`
+            # property and are not allowed to replace or reconfigure it
+            self._tfidf_model = TfidfModel()
 
         if corpus is not None:
             self.add_documents(corpus)
+
+    @property
+    def tfidf_model(self):
+        """The :class:`~gensim.models.tfidfmodel.TfidfModel` owned by this index (TF-IDF mode only).
+
+        Its collection statistics are extended automatically by every successful
+        :meth:`add_documents` call. The property is read-only: assigning to ``tfidf_model``
+        raises :class:`AttributeError`. The model object itself must not be mutated by the
+        caller, because the on-disk raw-count shards and the model statistics must always
+        describe the same collection.
+
+        Raises
+        ------
+        AttributeError
+            Outside of streaming TF-IDF mode (``tfidf=False``), and on any assignment attempt.
+
+        """
+        if not getattr(self, 'tfidf', False):
+            raise AttributeError(
+                "tfidf_model is only available in streaming TF-IDF mode (construct with tfidf=True)"
+            )
+        return self._tfidf_model
 
     def __len__(self):
         """Get length of index."""
@@ -370,12 +631,19 @@ class Similarity(interfaces.SimilarityABC):
         Parameters
         ----------
         corpus : iterable of list of (int, number)
-            Corpus in BoW format.
+            Corpus in BoW format. In streaming TF-IDF mode (``tfidf=True``) this must be raw
+            bag-of-words counts following the format documented on the constructor; every
+            term id must be smaller than ``num_features``.
 
         Notes
         -----
         Internally, documents are buffered and then spilled to disk when there's `self.shardsize` of them
         (or when a query is issued).
+
+        In streaming TF-IDF mode the batch is applied atomically: documents are validated while
+        streaming from `corpus` (which is iterated exactly once), and any malformed document or
+        exception raised by the iterator rolls back every document and every model statistic of
+        this batch, leaving earlier batches queryable.
 
         Examples
         --------
@@ -393,6 +661,10 @@ class Similarity(interfaces.SimilarityABC):
             >>> index.add_documents(one_more_corpus)  # add more documents in corpus
 
         """
+        if getattr(self, 'tfidf', False):
+            self._add_documents_tfidf(corpus)
+            return
+
         min_ratio = 1.0  # 0.5 to only reopen shards that are <50% complete
         if self.shards and len(self.shards[-1]) < min_ratio * self.shardsize:
             # The last shard was incomplete (<; load it back and add the documents there, don't start a new shard
@@ -414,6 +686,275 @@ class Similarity(interfaces.SimilarityABC):
                 self.close_shard()
             if len(self.fresh_docs) % 10000 == 0:
                 logger.info("PROGRESS: fresh_shard size=%i", len(self.fresh_docs))
+
+    # ------------------------------------------------------------------ #
+    # streaming TF-IDF mode internals
+    # ------------------------------------------------------------------ #
+    def _tfidf_shard_filename(self, shardid, in_progress=False):
+        """Path used for a TF-IDF shard; in-progress shards carry a temporary suffix."""
+        base = self.shardid2filename(shardid)
+        return base + '.inprogress' if in_progress else base
+
+    def _spill_tfidf_shard(self, docs, shardid, in_progress):
+        """Write one raw-count shard to disk and return its :class:`TfidfShard` proxy."""
+        fname = self._tfidf_shard_filename(shardid, in_progress=in_progress)
+        return TfidfShard(fname, docs, self.num_features)
+
+    def _add_documents_tfidf(self, corpus):
+        """Atomic raw-BoW ingestion for streaming TF-IDF mode.
+
+        The input iterator is consumed exactly once. Nothing visible to queries changes until
+        the whole batch has been validated: candidate shards are written under temporary names
+        and the model statistics are merged only at commit time. On any exception the temporary
+        shards are deleted and every piece of index state is restored to its pre-batch value.
+
+        Working memory is bounded by `shardsize` documents (the current spill buffer) plus the
+        model's document-frequency dictionary whose size is bounded by the vocabulary.
+        """
+        model = self._tfidf_model
+
+        # snapshot of every piece of state a failure must restore (an uninitialized
+        # TfidfModel has no dfs/idfs yet, which is represented by None)
+        snapshot = (
+            list(self.shards), len(self.fresh_docs), self.fresh_nnz,
+            getattr(model, 'num_docs', None), getattr(model, 'num_nnz', None),
+            getattr(model, 'dfs', None), getattr(model, 'idfs', None),
+        )
+        fresh_snapshot = [list(doc) for doc in self.fresh_docs]
+        candidate_shards = []
+        # batch-local statistics, merged into the model only at commit time
+        batch_docs, batch_nnz = 0, 0
+        batch_dfs = {}
+
+        def spill(buffer_docs):
+            shardid = len(self.shards) + len(candidate_shards)
+            shard = self._spill_tfidf_shard(buffer_docs, shardid, in_progress=True)
+            candidate_shards.append(shard)
+
+        try:
+            # an open partial shard from an earlier batch is kept as the query-time buffer; the
+            # new batch fills it first, then every shardsize documents form a new shard.
+            # buffer_docs always holds at most shardsize documents.
+            buffer_docs = [list(doc) for doc in fresh_snapshot]
+            for raw_doc in corpus:
+                # the same validation as TfidfModel.add_documents, plus the fixed id range
+                doc = validate_bow_document(raw_doc, max_id=self.num_features)
+                batch_docs += 1
+                batch_nnz += len(doc)
+                for termid, _ in doc:
+                    batch_dfs[termid] = batch_dfs.get(termid, 0) + 1
+                buffer_docs.append(doc)
+                if len(buffer_docs) >= self.shardsize:
+                    spill(buffer_docs)
+                    buffer_docs = []
+                    if batch_docs % 10000 == 0:
+                        logger.info("PROGRESS: TF-IDF batch processed %i documents", batch_docs)
+
+            if batch_docs == 0:
+                # an empty batch changes nothing; leave the pre-existing buffer untouched
+                return
+
+            # commit phase: first make the model statistics describe the whole collection ...
+            model._merge_batch_statistics(batch_docs, batch_nnz, batch_dfs)
+
+            # ... then publish the on-disk shards under their final names. shards that already
+            # existed before this batch are never touched (no rewrite of historical data).
+            published = []
+            for position, shard in enumerate(candidate_shards):
+                final_id = len(self.shards) + position
+                final_name = self._tfidf_shard_filename(final_id, in_progress=False)
+                tmp_name = shard.fullname()
+                # the proxy plus every numpy/scipy side file SaveLoad created for this shard
+                for tmp_path in sorted(glob.glob(tmp_name + '*')):
+                    suffix = tmp_path[len(tmp_name):]
+                    os.rename(tmp_path, final_name + suffix)
+                shard.dirname, shard.fname = os.path.split(final_name)
+                if hasattr(shard, 'index'):
+                    del shard.index
+                if hasattr(shard, '_data'):
+                    del shard._data
+                published.append(shard)
+            self.shards.extend(published)
+            # documents left in the spill buffer stay queryable via close_shard() at query/save
+            # time; buffer_docs already contains the pre-existing partial shard plus new tail docs
+            self.fresh_docs = buffer_docs
+            self.fresh_nnz = sum(len(doc) for doc in buffer_docs)
+        except BaseException:
+            # roll back: drop every file the failed batch wrote and restore the snapshot
+            for shard in candidate_shards:
+                self._delete_shard_files(shard.fullname())
+            self.shards = snapshot[0]
+            self.fresh_docs = fresh_snapshot
+            self.fresh_nnz = snapshot[2]
+            model.num_docs, model.num_nnz = snapshot[3], snapshot[4]
+            if snapshot[5] is None:
+                # the model was uninitialized before this batch: remove the attributes a merge
+                # would have created, instead of leaving empty dictionaries behind
+                for attr in ('dfs', 'idfs', 'cfs', 'term_lengths'):
+                    if hasattr(model, attr):
+                        delattr(model, attr)
+            else:
+                model.dfs, model.idfs = snapshot[5], snapshot[6]
+            raise
+
+    @staticmethod
+    def _delete_shard_files(prefix):
+        """Best-effort removal of every file belonging to one shard (proxy + numpy arrays)."""
+        for fname in glob.glob(prefix + '*'):
+            try:
+                os.remove(fname)
+            except OSError:
+                logger.warning("could not remove temporary shard file %s", fname)
+
+    def _current_idf_vector(self):
+        """Current IDF weight of every feature as a length-``num_features`` numpy array."""
+        idfs = self._tfidf_model.idfs
+        idf = numpy.zeros(self.num_features, dtype=numpy.float32)
+        if idfs:
+            ids = numpy.fromiter(idfs.keys(), dtype=numpy.int64, count=len(idfs))
+            vals = numpy.fromiter(idfs.values(), dtype=numpy.float64, count=len(idfs))
+            idf[ids.astype(numpy.intp)] = vals.astype(numpy.float32)
+        return idf
+
+    def _all_weighted_shards(self, idf):
+        """Yield ``(row_offset, weighted_csr)`` for every closed shard and the current buffer.
+
+        The buffer (documents accepted since the last query but not yet a full shard) is
+        materialized through the same raw-count path, so buffered and closed documents share
+        exactly the same weighting code.
+
+        Each shard's raw matrix is memory-mapped, used to build one weighted matrix and
+        released again within the loop: resident memory stays bounded by one shard plus the
+        current query chunk instead of growing with the number of historical shards. The
+        operating system page cache still makes repeated accesses fast.
+        """
+        offset = 0
+        for shard in self.shards:
+            raw = shard.load_raw()
+            try:
+                weighted = shard.weighted_index_from_raw(raw, idf)
+            finally:
+                del raw  # close the mapping as soon as the weighted copy exists
+            yield offset, weighted
+            offset += len(shard)
+        if self.fresh_docs:
+            tmp = TfidfShard.__new__(TfidfShard)
+            tmp.dirname, tmp.fname = '', ''
+            tmp.num_features = self.num_features
+            tmp.length = len(self.fresh_docs)
+            tmp._data = matutils.corpus2csc(
+                self.fresh_docs, num_terms=self.num_features, num_docs=len(self.fresh_docs),
+                num_nnz=sum(len(doc) for doc in self.fresh_docs), dtype=numpy.float32
+            ).T.tocsr()
+            yield offset, tmp.weighted_index(idf)
+
+    def _build_query_csr(self, query_docs):
+        """Transform one validated raw-BoW query chunk into an L2-normalized CSR query matrix."""
+        model = self._tfidf_model
+        transformed = [model[doc] for doc in query_docs]
+        return matutils.corpus2csc(
+            transformed, num_terms=self.num_features, num_docs=len(transformed),
+            num_nnz=sum(len(doc) for doc in transformed), dtype=numpy.float32
+        ).T.tocsr()
+
+    def _query_tfidf(self, query):
+        """Query entry point for streaming TF-IDF mode."""
+        self.close_shard()  # flush buffered documents so row numbers cover every accepted doc
+
+        is_corpus, query_obj = utils.is_corpus(query)
+        is_corpus = is_corpus or (
+            hasattr(query_obj, 'ndim') and query_obj.ndim > 1 and query_obj.shape[0] > 1
+        )
+
+        # an index that never received documents has no statistics at all: every result is zero
+        if len(self) == 0:
+            if not is_corpus:
+                result = numpy.zeros(0, dtype=numpy.float32)
+            else:
+                n_queries = query_obj.shape[0] if hasattr(query_obj, 'shape') else len(query_obj)
+                result = numpy.zeros((n_queries, 0), dtype=numpy.float32)
+            if self.num_best is not None:
+                # no documents means no top-k hits; one empty list per query document
+                if not is_corpus:
+                    return []
+                return [[] for _ in range(result.shape[0])]
+            return result
+
+        idf = self._current_idf_vector()
+
+        if not is_corpus:
+            # a single raw-BoW document; validate before touching any shard
+            bow = validate_bow_document(query_obj, max_id=self.num_features)
+            transformed = self._tfidf_model[bow]
+            qvec = matutils.corpus2csc(
+                [transformed], num_terms=self.num_features, num_docs=1,
+                num_nnz=len(transformed), dtype=numpy.float32
+            ).T.tocsr()
+            return self._score_tfidf(qvec, idf, single=True)
+
+        # corpus query: stream the input in chunksize-bounded pieces. Only one chunk of query
+        # documents and one chunk of score rows is held at a time; the final stacked score array
+        # is the documented return value and is not counted as working area (same convention as
+        # the ordinary Similarity path).
+        result_chunks = []
+        chunk = []
+        saw_any = False
+        for raw_query_doc in query_obj:
+            chunk.append(validate_bow_document(raw_query_doc, max_id=self.num_features))
+            saw_any = True
+            if len(chunk) >= self.chunksize:
+                qchunk = self._build_query_csr(chunk)
+                result_chunks.append(self._score_tfidf(qchunk, idf, single=False))
+                chunk = []
+        if not saw_any:
+            # an empty corpus query returns an empty result, shaped like the ordinary path
+            return numpy.empty((0, len(self)), dtype=numpy.float32)
+        if chunk:
+            qchunk = self._build_query_csr(chunk)
+            result_chunks.append(self._score_tfidf(qchunk, idf, single=False))
+        result = numpy.vstack(result_chunks)
+
+        if self.num_best is not None:
+            return [self._topk_rows(row) for row in result]
+        return result
+
+    def _score_tfidf(self, qcsr, idf, single):
+        """Compute similarity of one CSR query matrix against every weighted shard."""
+        pieces = []
+        for offset, weighted in self._all_weighted_shards(idf):
+            # (N x T) @ (T x Q) -> N x Q; both matrices' rows are L2-normalized already.
+            # shards are emitted in row order with contiguous offsets, so hstacking their
+            # results reproduces the global document row numbers
+            sims = (weighted @ qcsr.T).toarray().T.astype(numpy.float32)
+            pieces.append(sims)
+        if not pieces:
+            sims = numpy.empty((qcsr.shape[0], 0), dtype=numpy.float32)
+        else:
+            sims = numpy.hstack(pieces)
+
+        if self.num_best is not None:
+            if single:
+                return self._topk_rows(sims[0])
+            return sims
+        if single:
+            return sims[0]
+        return sims
+
+    def _topk_rows(self, row):
+        """Top-`num_best` ``(row_number, score)`` pairs of one score row.
+
+        Zero scores are excluded; equal positive scores break ties by ascending row number,
+        which makes the ordering deterministic and independent of shard boundaries.
+        """
+        if self.num_best <= 0:
+            return []
+        nnz = numpy.nonzero(row > 1e-12)[0]
+        if nnz.size == 0:
+            return []
+        # stable sort on (-score, row): exact zeros are already removed and ties keep row order
+        order = numpy.lexsort((nnz, -row[nnz]))
+        picked = nnz[order[:self.num_best]]
+        return [(int(pos), float(row[pos])) for pos in picked]
 
     def shardid2filename(self, shardid):
         """Get shard file by `shardid`.
@@ -448,6 +989,13 @@ class Similarity(interfaces.SimilarityABC):
         if not self.fresh_docs:
             return
         shardid = len(self.shards)
+        if getattr(self, 'tfidf', False):
+            # raw counts are spilled as-is; TF-IDF weighting is deferred to query time so that
+            # the shard always uses the collection statistics current at query time
+            shard = self._spill_tfidf_shard(self.fresh_docs, shardid, in_progress=False)
+            self.shards.append(shard)
+            self.fresh_docs, self.fresh_nnz = [], 0
+            return
         # consider the shard sparse if its density is < 30%
         issparse = 0.3 > 1.0 * self.fresh_nnz / (len(self.fresh_docs) * self.num_features)
         if issparse:
@@ -534,6 +1082,11 @@ class Similarity(interfaces.SimilarityABC):
             >>> result = index[corpus]  # pairwise similarities of each document against each document
 
         """
+        if getattr(self, 'tfidf', False):
+            # streaming TF-IDF mode: queries are raw BoW and get weighted with the current
+            # collection statistics inside _query_tfidf
+            return self._query_tfidf(query)
+
         self.close_shard()  # no-op if no documents added to index since last query
 
         # reset num_best and normalize parameters, in case they were changed dynamically
@@ -616,7 +1169,12 @@ class Similarity(interfaces.SimilarityABC):
                 break
         if not self.shards or docpos < 0 or docpos >= pos:
             raise ValueError("invalid document position: %s (must be 0 <= x < %s)" % (docpos, len(self)))
-        result = shard.get_document_id(docpos - pos + len(shard))
+        local_pos = docpos - pos + len(shard)
+        if getattr(self, 'tfidf', False):
+            # return the *current* L2-normalized TF-IDF vector, not the raw counts
+            idf = self._current_idf_vector()
+            return shard.weighted_index(idf)[local_pos]
+        result = shard.get_document_id(local_pos)
         return result
 
     def similarity_by_id(self, docpos):
@@ -645,6 +1203,13 @@ class Similarity(interfaces.SimilarityABC):
             >>> similarities = index.similarity_by_id(1)
 
         """
+        if getattr(self, 'tfidf', False):
+            # vector_by_id already returns the current normalized TF-IDF row; score it directly
+            # against every weighted shard without round-tripping through the raw-BoW validator
+            self.close_shard()
+            idf = self._current_idf_vector()
+            qvec = self.vector_by_id(docpos)
+            return self._score_tfidf(qvec, idf, single=True)
         query = self.vector_by_id(docpos)
         norm, self.norm = self.norm, False
         result = self[query]
@@ -661,6 +1226,20 @@ class Similarity(interfaces.SimilarityABC):
             Similarities of each document in turn against the index.
 
         """
+        if getattr(self, 'tfidf', False):
+            # stream the indexed raw BoW documents themselves as chunked queries, so each row is
+            # weighted with the current collection statistics exactly like an external query
+            self.close_shard()
+            for chunk in self.iter_chunks():
+                # chunk is a small list of raw BoW documents
+                sims = self[chunk]
+                if sims.shape[0] > 1:
+                    for sim in sims:
+                        yield sim
+                else:
+                    yield sims[0]
+            return
+
         # turn off query normalization (vectors in the index are already normalized, save some CPU)
         norm, self.norm = self.norm, False
 
@@ -693,6 +1272,16 @@ class Similarity(interfaces.SimilarityABC):
         if chunksize is None:
             # if not explicitly specified, use the chunksize from the constructor
             chunksize = self.chunksize
+
+        if getattr(self, 'tfidf', False):
+            # yield raw BoW chunks (lists of (term_id, count) pairs) instead of matrix slices;
+            # each yielded chunk holds at most `chunksize` documents
+            for shard in self.shards:
+                raw = shard.get_index()
+                for chunk_start in range(0, len(shard), chunksize):
+                    chunk_end = min(len(shard), chunk_start + chunksize)
+                    yield [matutils.scipy2sparse(raw[pos], eps=0.0) for pos in range(chunk_start, chunk_end)]
+            return
 
         for shard in self.shards:
             query = shard.get_index().index

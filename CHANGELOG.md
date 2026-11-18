@@ -1,6 +1,22 @@
 Changes
 =======
 
+## Unreleased
+
+### :star2: New Features
+
+* Incremental collection statistics for `TfidfModel.add_documents(corpus)`: cumulative
+  `num_docs`, `num_nnz`, `dfs` and `idfs` updates from streamed bag-of-words batches, with
+  atomic failure handling and strict input validation. Only the default weighting
+  configuration (`wlocal=identity`, `wglobal=df2idf`, boolean `normalize`, no SMART/pivot)
+  is supported incrementally; other configurations raise `ValueError` before the input is read.
+* Streaming TF-IDF mode for the sharded `Similarity` index via a keyword-only `tfidf=True`:
+  raw bag-of-words ingestion, an owned read-only `TfidfModel` exposed as `tfidf_model`,
+  disk-backed raw-count shards re-weighted with the current collection statistics on every
+  query, bounded working memory, atomic batch rollback and save/load with continued appends.
+  A term whose IDF used to be zero recovers automatically as later batches lower its document
+  frequency.
+
 ## 4.3.3, 2024-07-19
 
 ### :star2: New Features
